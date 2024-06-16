@@ -1,6 +1,14 @@
+import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:web3dart/web3dart.dart';
+import 'package:flutter/services.dart';
+import 'package:web3dart/crypto.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 
-void main() {
+void main() async {
+  await dotenv.load(fileName: '.env');
   runApp(const MyApp());
 }
 
@@ -10,116 +18,222 @@ class MyApp extends StatelessWidget {
   // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-        useMaterial3: true,
-      ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+    return const MaterialApp(
+      home: WalletApp(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
-
+class WalletApp extends StatefulWidget {
+  const WalletApp({super.key});
+  
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  WalletAppState createState() => WalletAppState();
+
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class WalletAppState extends State<WalletApp> {
+  final String apiKey = dotenv.get('API_KEY');
+  late final String rpcUrl = 'https://polygon-amoy.infura.io/v3/$apiKey';
+  final int chainId = int.parse(dotenv.get('CHAIN_ID'));
+  
+  late Web3Client _client;
+  EthPrivateKey? _credentials;
+  EthereumAddress? _ownAddress;
+  String? _address;
+  String? _balance;
+  String? _transactionHash;
+  final TextEditingController _toAddressController = TextEditingController();
+  final TextEditingController _amountController = TextEditingController();
 
-  void _incrementCounter() {
+  @override
+  void initState() {
+    super.initState();
+    _client = Web3Client(rpcUrl, http.Client());
+    _loadWallet();
+  }
+
+  Future<void> _loadWallet() async {
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    String? privateKey = prefs.getString('privateKey');
+    if (privateKey != null) {
+      final credentials = EthPrivateKey.fromHex(privateKey);
+      final address = credentials.address;
+      _client.getBalance(address).then((EtherAmount result){
+        setState(() {
+          _balance = _weiToEth(result);
+          });
+      });
+      setState(() {
+        _credentials = credentials;
+        _ownAddress = address;
+        _address = address.hex;
+      });
+      debugPrint('Loaded Address: $_address');
+    }
+  }
+
+  Future<void> createWallet() async {
+    final credentials = EthPrivateKey.createRandom(Random.secure());
+    final address = credentials.address;
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    await prefs.setString('privateKey', bytesToHex(credentials.privateKey, include0x: true));
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _credentials = credentials;
+      _ownAddress = address;
+      _address = address.hex;
+      
     });
+    debugPrint('New Address: $_address');
+    debugPrint('Private Key: ${bytesToHex(credentials.privateKey, include0x: true)}');
+  }
+
+  Future<void> send() async {
+    if (_credentials == null || _ownAddress == null) {
+      debugPrint('Please create a wallet first.');
+      return;
+    }
+
+    final toAddress = EthereumAddress.fromHex(_toAddressController.text);
+    final amountInEth = double.parse(_amountController.text);
+    final amountInWei = BigInt.from(amountInEth * 1e18);
+    final amount = EtherAmount.fromBigInt(EtherUnit.wei, amountInWei);
+    final gasPrice = await _client.getGasPrice();
+    final nonce = await _client.getTransactionCount(_ownAddress!, atBlock: const BlockNum.pending());
+
+    if (toAddress.toString() == '') {
+      debugPrint('Please set to address.');
+      return;
+    }
+
+    final transaction = Transaction(
+      from: _ownAddress!,
+      to: toAddress,
+      value: amount,
+      gasPrice: gasPrice,
+      maxGas: 21000,
+      nonce: nonce,
+    );
+
+    try {
+      final txHash = await _client.sendTransaction(
+        _credentials!,
+        transaction,
+        chainId: chainId,
+      );
+      _client.getBalance(_ownAddress!).then((EtherAmount result){
+        setState(() {
+          _balance = _weiToEth(result);
+          });
+      });
+      setState(() {
+        _transactionHash = txHash;
+      });
+      debugPrint('Transaction Hash: $txHash');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Transaction successful: $txHash')),
+      );
+    } catch (e) {
+      debugPrint('Transaction failed: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Transaction failed: $e')),
+      );
+    }
+  }
+
+  String _weiToEth(EtherAmount wei) {
+    final ethAmount = EtherAmount.fromBigInt(EtherUnit.wei, wei.getInWei);
+    return ethAmount.getValueInUnit(EtherUnit.ether).toString();
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+        title: const Text('Web3 Wallet App'),
       ),
       body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
         child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
           mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
-            const Text(
-              'You have pushed the button this many times:',
+            if (_address == null) 
+            ElevatedButton(
+              onPressed: createWallet,
+              child: const Text('Create Wallet'),
             ),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+            const SizedBox(height: 20),            
+              Padding(
+                padding: const EdgeInsets.all(8.0),
+                child: Column(
+                  children: [
+                    Text('Address: $_address'),
+                    const SizedBox(height: 10),
+                    Text('Balance: $_balance MATIC'),
+                    const SizedBox(height: 10),
+                    ElevatedButton(
+                      onPressed: () {
+                        if (_address != null) {
+                          Clipboard.setData(ClipboardData(text: _address!));
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Address copied to clipboard'))
+                          );
+                        }
+                      },
+                      child: const Text('Copy Address'),
+                    ),
+                  ],
+                ),
+              ),
+
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                SizedBox(
+                  width: 150,
+                  child: TextField(
+                    controller: _toAddressController,
+                    decoration: const InputDecoration(
+                      labelText: 'To Address',
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                SizedBox(
+                  width: 100,
+                  child: TextField(
+                    controller: _amountController,
+                    decoration: const InputDecoration(
+                      labelText: 'Amount (MATIC)',
+                    ),
+                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  ),
+                ),
+                const SizedBox(width: 10),
+
+                ElevatedButton(
+                  onPressed: send,
+                  child: const Text('Send'),
+                ),
+              ],
             ),
+            if (_transactionHash != null)
+              Padding(
+                padding: const EdgeInsets.all(8.0),
+                child: Text('Transaction Hash: $_transactionHash'),
+              ),
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
     );
+  }
+
+  @override
+  void dispose() {
+    _client.dispose();
+    _toAddressController.dispose();
+    _amountController.dispose();
+    super.dispose();
   }
 }
